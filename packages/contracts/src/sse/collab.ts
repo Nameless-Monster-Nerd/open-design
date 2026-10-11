@@ -122,6 +122,18 @@ export interface WorkspaceContextChangedSsePayload {
   at?: number;
 }
 
+/**
+ * The signed-in account's workspace membership directory changed.
+ *
+ * This is intentionally account-wide and carries no Workspace id or content:
+ * a newly-created/joined Workspace cannot yet have a local Workspace-scoped
+ * stream, and consumers only need a signal to re-read the authoritative list.
+ */
+export interface WorkspaceDirectoryChangedSsePayload {
+  type: 'workspace-directory-changed';
+  at?: number;
+}
+
 /** Subscription / seat billing changed. */
 export interface WorkspaceBillingChangedSsePayload {
   type: 'billing-changed';
@@ -154,6 +166,16 @@ export interface WorkspaceWalletBalanceChangedSsePayload {
   at?: number;
 }
 
+/** Quota consumption changed even when the wallet balance stayed unchanged. */
+export interface WorkspaceCodingPlanUsageChangedSsePayload {
+  type: 'coding-plan-usage-changed';
+  workspaceId: string;
+  workspaceMemberId: string;
+  /** Durable upstream event cursor, independent of wallet/subscription revisions. */
+  eventId: string;
+  at?: number;
+}
+
 /**
  * Workspace-scoped invalidation events carried on `/api/workspace/events`.
  * The EventSource URL carries an exact Workspace/member pair and the daemon
@@ -168,9 +190,11 @@ export type WorkspaceInvalidationSsePayload =
   | TeamResourcesChangedSsePayload
   | WorkspaceMembersChangedSsePayload
   | WorkspaceContextChangedSsePayload
+  | WorkspaceDirectoryChangedSsePayload
   | WorkspaceBillingChangedSsePayload
   | WorkspaceBillingSubscriptionChangedSsePayload
-  | WorkspaceWalletBalanceChangedSsePayload;
+  | WorkspaceWalletBalanceChangedSsePayload
+  | WorkspaceCodingPlanUsageChangedSsePayload;
 
 /** The SSE `event:` names for the workspace-scoped invalidations. */
 export const WORKSPACE_INVALIDATION_EVENTS = [
@@ -179,9 +203,11 @@ export const WORKSPACE_INVALIDATION_EVENTS = [
   'team-resources-changed',
   'members-changed',
   'workspace-context-changed',
+  'workspace-directory-changed',
   'billing-changed',
   'billing-subscription-changed',
   'wallet-balance-changed',
+  'coding-plan-usage-changed',
 ] as const;
 
 export type WorkspaceInvalidationEventName =

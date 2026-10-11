@@ -61,7 +61,7 @@ afterEach(() => {
 
 describe('EntryNavRail sign-out (recvqbkcLqIFH7)', () => {
   it('clears a stale CloudSignInTip dismissal so the sign-in card can render again', async () => {
-    // Simulate a session that dismissed the "Open Design Cloud 版" card at
+    // Simulate a session that dismissed the "OpenDesign Cloud 版" card at
     // some earlier point — the exact stale state that hides the sign-in
     // entry point after a later real sign-out.
     window.localStorage.setItem(DISMISSED_KEY, '1');
@@ -105,7 +105,7 @@ describe('EntryNavRail sign-out (recvqbkcLqIFH7)', () => {
     );
 
     expect(screen.getByTestId('entry-cloud-signin-tip')).toBeTruthy();
-    expect(screen.getByText('登录')).toBeTruthy();
-    expect(screen.getByText('登录即可享受云端协作')).toBeTruthy();
+    expect(screen.getByText('注册 / 登录')).toBeTruthy();
+    expect(screen.getByText('注册即领免费额度')).toBeTruthy();
   });
 });

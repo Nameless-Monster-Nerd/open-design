@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 /**
- * The signed-out rail's bottom "Open Design Cloud" callout is the ONLY entry
+ * The signed-out rail's bottom "OpenDesign Cloud" callout is the ONLY entry
  * point for this card — unlike its siblings (AmrLoginPill, InlineModelSwitcher,
  * EntryShell's onboarding flow), it must release the daemon's login lock on a
  * timed-out attempt, or a retry click can never spawn a fresh `vela login`
@@ -63,6 +63,54 @@ function renderTip() {
 }
 
 describe('CloudSignInTip', () => {
+  it('turns the call to action into a pending state and offers to reopen the sign-in page only after a delay', async () => {
+    let loginStarted = false;
+    globalThis.fetch = vi.fn(async (input, init) => {
+      const url = typeof input === 'string' ? input : (input as URL).toString();
+      if (url.endsWith('/api/integrations/vela/status')) {
+        return jsonResponse({
+          body: loginStarted
+            ? {
+                loggedIn: false,
+                loginInFlight: true,
+                activationUrl: 'https://amr.example/activate',
+                profile: 'prod',
+                user: null,
+                configPath: '/x',
+              }
+            : { loggedIn: false, profile: 'prod', user: null, configPath: '/x' },
+        });
+      }
+      if (url.endsWith('/api/integrations/vela/login') && init?.method === 'POST') {
+        loginStarted = true;
+        return jsonResponse({ status: 202, body: { pid: 4242 } });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    renderTip();
+    const card = await screen.findByTestId('entry-cloud-signin-tip');
+    expect(screen.getByText('Sign up / Sign in')).toBeTruthy();
+    vi.useFakeTimers();
+    fireEvent.click(card);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2500);
+    });
+
+    expect(screen.getByText('Signing in…')).toBeTruthy();
+    expect(screen.queryByText('Sign up / Sign in')).toBeNull();
+    expect(screen.queryByText("Sign-in page didn't open?")).toBeNull();
+    expect(screen.getAllByRole('button', { name: /cancel/i })).toHaveLength(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(screen.getByText("Sign-in page didn't open?")).toBeTruthy();
+    expect(screen.getByRole('link', { name: /Reopen/i }).getAttribute('href')).toBe(
+      'https://amr.example/activate',
+    );
+  });
+
   it('cancels a timed-out login so a retry click can start a fresh vela login', async () => {
     let loginStarted = false;
     let spawnCount = 0;
@@ -173,7 +221,7 @@ describe('RailAccountSyncTip', () => {
     // Same headline as the callout it replaces (now screen-reader-only, see
     // the skeleton-shape test below), so assistive tech still announces the
     // swap as a state change on the same card rather than a different one.
-    expect(status.textContent).toContain('Open Design Cloud');
+    expect(status.textContent).toContain('OpenDesign Cloud');
     expect(status.textContent).toContain('Loading');
   });
 
@@ -196,7 +244,7 @@ describe('RailAccountSyncTip', () => {
     const status = await screen.findByTestId('entry-rail-account-sync-tip');
     expect(status.querySelector('.entry-rail-account-skeleton__avatar')).not.toBeNull();
     expect(status.querySelector('.entry-rail-account-skeleton__name')).not.toBeNull();
-    // The old card rendered a visible "Open Design Cloud" / "Loading…" pair
+    // The old card rendered a visible "OpenDesign Cloud" / "Loading…" pair
     // of text nodes for sighted users; that text now exists for assistive
     // tech only, so a plain <strong> headline must not reappear inline.
     expect(status.querySelector('strong')).toBeNull();

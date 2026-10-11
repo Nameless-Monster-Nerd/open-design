@@ -64,6 +64,8 @@ describe('FileViewer source syntax highlighting', () => {
       />,
     );
 
+    const previewFrame = container.querySelector('iframe[data-od-render-mode="srcdoc"]');
+    expect(previewFrame).not.toBeNull();
     fireEvent.click(screen.getByRole('tab', { name: /^code$/i }));
 
     await waitFor(() => {
@@ -72,11 +74,17 @@ describe('FileViewer source syntax highlighting', () => {
     const sourceView = container.querySelector('.viewer-source');
     expect(sourceView?.textContent).toBe(source);
     expect(sourceView?.querySelector('span[style*="color"]')).not.toBeNull();
+    expect(container.querySelector('iframe[data-od-render-mode="srcdoc"]')).toBe(previewFrame);
+    expect(previewFrame?.closest('.preview-viewport')?.hasAttribute('hidden')).toBe(true);
 
     document.documentElement.setAttribute('data-theme', 'dark');
     await waitFor(() => {
       expect(highlightCodeTokensMock).toHaveBeenCalledTimes(2);
     });
+
+    fireEvent.click(screen.getByRole('tab', { name: /^preview$/i }));
+    expect(container.querySelector('iframe[data-od-render-mode="srcdoc"]')).toBe(previewFrame);
+    expect(previewFrame?.closest('.preview-viewport')?.hasAttribute('hidden')).toBe(false);
   });
 
   it.each([

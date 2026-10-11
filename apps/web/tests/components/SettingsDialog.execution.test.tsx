@@ -407,6 +407,14 @@ function renderSettingsDialog(
   };
 }
 
+// The signed-out banner carries its own "Sign up / Sign in"; card-level
+// assertions scope to the OpenDesign card so they don't match the banner.
+function amrCardElement(): HTMLElement {
+  const card = screen.getByTestId('settings-agent-select-amr').closest('.agent-card');
+  if (!(card instanceof HTMLElement)) throw new Error('missing OpenDesign card');
+  return card;
+}
+
 function renderIntegrationsView(
   initial: Partial<AppConfig> = {},
   options: {
@@ -1248,7 +1256,7 @@ describe('SettingsDialog execution settings BYOK interactions', () => {
     );
   });
 
-  it('surfaces autosave progress, success, and failure states in the modal chrome', async () => {
+  it('surfaces autosave progress, success, and failure states outside the modal chrome', async () => {
     const first = renderSettingsDialog();
 
     fireEvent.change(screen.getByLabelText('API key'), {
@@ -1261,6 +1269,9 @@ describe('SettingsDialog execution settings BYOK interactions', () => {
     await waitFor(() => {
       expect(screen.getByText('All changes saved')).toBeTruthy();
     });
+    const savedStatus = screen.getByText('All changes saved').closest('[role="status"]');
+    expect(savedStatus?.parentElement).toHaveClass('settings-autosave-layer');
+    expect(savedStatus?.closest('.settings-chrome')).toBeNull();
     expect(first.onPersist).toHaveBeenCalledWith(
       expect.objectContaining({ apiKey: 'sk-ant-saved' }),
       expect.any(Object),
@@ -1277,6 +1288,70 @@ describe('SettingsDialog execution settings BYOK interactions', () => {
 
     await waitFor(() => {
       expect(screen.getByText('Saving…')).toBeTruthy();
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/Couldn’t save changes/i)).toBeTruthy();
+    });
+    const errorStatus = screen.getByText(/Couldn’t save changes/i).closest('[role="status"]');
+    expect(errorStatus?.parentElement).toHaveClass('settings-autosave-layer');
+  });
+
+  it('keeps a newer failed Labs save ahead of an older ordinary autosave', async () => {
+    const ordinarySave = deferred<void>();
+    const labsSave = deferred<void>();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/strategies/od-next/rollout') {
+        return new Response(JSON.stringify({
+          status: {
+            strategyId: 'od-next-strategy',
+            scope: 'daemon_instance',
+            requestedMode: 'off',
+            requestedModeSource: 'default',
+            effectiveMode: 'off',
+          },
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url === '/api/app-config') {
+        await labsSave.promise;
+        return new Response('{}', { status: 500 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const view = renderSettingsDialog();
+    view.onPersist.mockImplementationOnce(() => ordinarySave.promise);
+
+    fireEvent.change(screen.getByLabelText('API key'), {
+      target: { value: 'sk-ant-held' },
+    });
+    await waitFor(() => expect(view.onPersist).toHaveBeenCalledTimes(1));
+    expect(screen.getByText('Saving…')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: /Labs/i }));
+    const labsSwitch = await screen.findByTestId('labs-harness-switch');
+    await waitFor(() => expect(labsSwitch.getAttribute('aria-disabled')).toBe('false'));
+    fireEvent.click(labsSwitch);
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.filter(([input]) => input.toString() === '/api/app-config'))
+        .toHaveLength(1);
+    });
+
+    await act(async () => {
+      ordinarySave.resolve();
+      await ordinarySave.promise;
+      await Promise.resolve();
+    });
+    expect(screen.queryByText('All changes saved')).toBeNull();
+    expect(screen.getByText('Saving…')).toBeTruthy();
+
+    await act(async () => {
+      labsSave.resolve();
+      await labsSave.promise;
+      await Promise.resolve();
     });
     await waitFor(() => {
       expect(screen.getByText(/Couldn’t save changes/i)).toBeTruthy();
@@ -2676,7 +2751,7 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
     vi.unstubAllGlobals();
   });
 
-  it('pins Open Design to the top of the installed CLI list', () => {
+  it('pins OpenDesign to the top of the installed CLI list', () => {
     const claudeAgent: AgentInfo = {
       id: 'claude',
       name: 'Claude Code',
@@ -3244,6 +3319,60 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
     expect(screen.getByRole('button', { name: 'Test' })).toBeTruthy();
   });
 
+  it('shows the concrete model reported by a Local CLI connection test', async () => {
+    const claudeAgent: AgentInfo = {
+      id: 'claude',
+      name: 'Claude Code',
+      bin: 'claude',
+      available: true,
+      version: '2.1.220',
+      models: [
+        { id: 'default', label: 'Default' },
+        { id: 'opus', label: 'Opus (alias)' },
+      ],
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/memory') {
+        return new Response(
+          JSON.stringify({ enabled: true, memories: [], extraction: null }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url === '/api/test/connection') {
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            kind: 'success',
+            latencyMs: 42,
+            model: 'opus',
+            resolvedModel: 'claude-opus-5',
+            agentName: 'Claude Code',
+            sample: 'ok',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }));
+
+    renderSettingsDialog(
+      {
+        mode: 'daemon',
+        agentId: 'claude',
+        agentModels: { claude: { model: 'opus' } },
+      },
+      { agents: [claudeAgent] },
+    );
+
+    fireEvent.click(screen.getByRole('tab', { name: /Local CLI.*1 installed/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'Test' }));
+
+    expect(
+      await screen.findByText(/Claude Code replied in 42 ms.*Model: claude-opus-5/i),
+    ).toBeTruthy();
+  });
+
   it('renders the AMR local agent without vela branding and with the Local CLI test action', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = input.toString();
@@ -3290,11 +3419,11 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
     expect(screen.queryByText('Lower cost')).toBeNull();
     expect(screen.getByText('Many models')).toBeTruthy();
     expect(screen.queryByText('Limited bonus: +100%')).toBeNull();
-    expect(await screen.findByRole('button', { name: 'Authorize' })).toBeTruthy();
+    expect(await within(amrCardElement()).findByRole('button', { name: 'Sign up / Sign in' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Test' })).toBeNull();
   });
 
-  it('only shows the AMR authorization action after selecting the AMR card', async () => {
+  it('selects the signed-out OpenDesign row in place and only then offers sign-up', async () => {
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = input.toString();
       if (url === '/api/workspace/context') {
@@ -3327,17 +3456,213 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
     );
 
     fireEvent.click(screen.getByRole('tab', { name: /Local CLI.*2 installed/i }));
-    expect(screen.getByTestId('settings-agent-select-amr')).toBeTruthy();
-    expect(screen.queryByRole('button', { name: 'Authorize' })).toBeNull();
+    const amrCard = screen.getByTestId('settings-agent-select-amr').closest('.agent-card');
+    if (!(amrCard instanceof HTMLElement)) throw new Error('missing AMR card');
+    await waitFor(() => {
+      expect(screen.getAllByRole('button', { name: 'Sign up / Sign in' })).toHaveLength(1);
+    });
+    expect(within(amrCard).queryByRole('button', { name: 'Sign up / Sign in' })).toBeNull();
+    expect(within(amrCard).queryByText('Free Credits')).toBeNull();
 
     fireEvent.click(screen.getByTestId('settings-agent-select-amr'));
 
-    expect(await screen.findByRole('button', { name: 'Authorize' })).toBeTruthy();
+    expect(screen.getByTestId('settings-agent-select-amr').getAttribute('aria-pressed')).toBe(
+      'true',
+    );
+    expect(
+      await within(amrCard).findByRole('button', { name: 'Sign up / Sign in' }),
+    ).toBeTruthy();
   });
 
-  // recvqfYKutwWlQ: a personal workspace always resolves `canManageBilling`
-  // true (the user is their own owner), so the upgrade entry stays visible
-  // for a signed-in, upgrade-eligible AMR account with no team involved.
+  it('commits OpenDesign as the CLI once sign-in from its selected card succeeds', async () => {
+    let loginStarted = false;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url === '/api/workspace/context') {
+        return new Response(JSON.stringify({ context: null }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url === '/api/memory') {
+        return new Response(
+          JSON.stringify({ enabled: true, memories: [], extraction: null }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url === '/api/integrations/vela/login' && init?.method === 'POST') {
+        loginStarted = true;
+        return new Response(JSON.stringify({ pid: 1 }), {
+          status: 202,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url === '/api/integrations/vela/status') {
+        return new Response(
+          JSON.stringify(
+            loginStarted
+              ? {
+                  loggedIn: true,
+                  profile: 'local',
+                  user: { id: 'u', email: 'user@example.com' },
+                }
+              : { loggedIn: false, profile: 'local', user: null },
+          ),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url.startsWith('/api/integrations/vela/')) {
+        return new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const codexAgent = availableAgents.find((agent) => agent.id === 'codex');
+    if (!codexAgent) throw new Error('missing codex test agent');
+    const { onPersist } = renderSettingsDialog(
+      { mode: 'daemon', agentId: codexAgent.id },
+      { agents: [amrAgent, codexAgent] },
+    );
+
+    fireEvent.click(screen.getByRole('tab', { name: /Local CLI.*2 installed/i }));
+    const amrSelect = screen.getByTestId('settings-agent-select-amr');
+    const amrCard = amrSelect.closest('.agent-card');
+    if (!(amrCard instanceof HTMLElement)) throw new Error('missing AMR card');
+    expect(amrSelect.getAttribute('aria-pressed')).toBe('false');
+
+    fireEvent.click(amrSelect);
+    expect(amrSelect.getAttribute('aria-pressed')).toBe('true');
+    fireEvent.click(
+      await within(amrCard).findByRole('button', { name: 'Sign up / Sign in' }),
+    );
+    // Selected in Settings only: committing a signed-out OpenDesign would
+    // send the user back to onboarding.
+    expect(
+      onPersist.mock.calls.some(([config]) => (config as AppConfig).agentId === 'amr'),
+    ).toBe(false);
+
+    await waitFor(
+      () => {
+        expect(
+          onPersist.mock.calls.some(([config]) => (config as AppConfig).agentId === 'amr'),
+        ).toBe(true);
+      },
+      { timeout: 8000 },
+    );
+  }, 15_000);
+
+  it('keeps a DeepSeek Harness choice made after a pending OpenDesign pick when sign-in lands later', async () => {
+    let loginStarted = false;
+    let companionInstalled = false;
+    const dshAgent: AgentInfo = {
+      id: 'deepseek-harness',
+      name: 'DeepSeek Harness',
+      bin: 'deepseek-harness',
+      available: false,
+      path: '/usr/local/bin/deepseek-harness',
+      models: [{ id: 'deepseek-chat', label: 'DeepSeek Chat' }],
+      diagnostics: [
+        {
+          reason: 'runtime-profile-incompatible',
+          severity: 'error',
+          message: 'Companion setup required.',
+        },
+      ],
+    };
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      const json = (body: unknown, status = 200) =>
+        new Response(JSON.stringify(body), {
+          status,
+          headers: { 'content-type': 'application/json' },
+        });
+      if (url === '/api/workspace/context') return json({ context: null });
+      if (url === '/api/memory') {
+        return json({ enabled: true, memories: [], extraction: null });
+      }
+      if (url === '/api/agents/deepseek-harness/companion/install' && init?.method === 'POST') {
+        companionInstalled = true;
+        return json({ ok: true });
+      }
+      if (url === '/api/test/connection') return json({ ok: true, kind: 'success' });
+      if (url === '/api/integrations/vela/login' && init?.method === 'POST') {
+        loginStarted = true;
+        return json({ pid: 1 }, 202);
+      }
+      if (url === '/api/integrations/vela/status') {
+        return json(
+          loginStarted
+            ? { loggedIn: true, profile: 'local', user: { id: 'u', email: 'user@example.com' } }
+            : { loggedIn: false, profile: 'local', user: null },
+        );
+      }
+      if (url.startsWith('/api/integrations/vela/')) return json({});
+      throw new Error(`Unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const codexAgent = availableAgents.find((agent) => agent.id === 'codex');
+    if (!codexAgent) throw new Error('missing codex test agent');
+    const onRefreshAgents = vi.fn<OnRefreshAgents>(async () => [
+      amrAgent,
+      codexAgent,
+      companionInstalled ? { ...dshAgent, available: true, diagnostics: [] } : dshAgent,
+    ]);
+    const { onPersist } = renderSettingsDialog(
+      { mode: 'daemon', agentId: codexAgent.id },
+      { agents: [amrAgent, codexAgent, dshAgent], onRefreshAgents },
+    );
+
+    fireEvent.click(screen.getByRole('tab', { name: /Local CLI/i }));
+    const amrSelect = screen.getByTestId('settings-agent-select-amr');
+    fireEvent.click(amrSelect);
+    expect(amrSelect.getAttribute('aria-pressed')).toBe('true');
+
+    // DeepSeek needs setup, so its click opens the install dialog and commits
+    // the selection from the dialog rather than from the card handler.
+    fireEvent.click(screen.getByTestId('settings-agent-select-deepseek-harness'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Install and select' }));
+    await waitFor(() => {
+      expect(
+        onPersist.mock.calls.some(
+          ([config]) => (config as AppConfig).agentId === 'deepseek-harness',
+        ),
+      ).toBe(true);
+    });
+    expect(screen.getByTestId('settings-agent-select-amr').getAttribute('aria-pressed')).toBe(
+      'false',
+    );
+
+    const callout = document.querySelector('.settings-cloud-signin-callout');
+    if (!(callout instanceof HTMLElement)) throw new Error('missing cloud callout');
+    fireEvent.click(within(callout).getByRole('button', { name: 'Sign up / Sign in' }));
+    await waitFor(() => expect(screen.queryByText('Signing in…')).toBeNull(), {
+      timeout: 8000,
+    });
+    // Wait past the status poll that would have applied the stale pending pick.
+    await waitFor(
+      () => {
+        expect(
+          (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.filter(
+            ([u]) => String(u) === '/api/integrations/vela/status',
+          ).length,
+        ).toBeGreaterThan(1);
+      },
+      { timeout: 8000 },
+    );
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    const lastConfig = onPersist.mock.calls.at(-1)?.[0] as AppConfig | undefined;
+    expect(lastConfig?.agentId).toBe('deepseek-harness');
+    expect(
+      onPersist.mock.calls.some(([config]) => (config as AppConfig).agentId === 'amr'),
+    ).toBe(false);
+  }, 20_000);
+
   it('shows the AMR upgrade action for a personal identity with an upgradeable plan', async () => {
     const context = personalWorkspaceContext();
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
@@ -3426,9 +3751,9 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
 
     fireEvent.click(screen.getByRole('tab', { name: /Local CLI.*1 installed/i }));
 
-    // Let both identity sources resolve before checking the action. The $10
-    // value is account-scoped and must NOT be shown as this team workspace's
-    // balance while its explicit wallet response is unavailable.
+    // Let both identity sources resolve before checking the action. A Team
+    // card must not fall back to the member's personal account balance when
+    // the environment-scoped workspace wallet is unavailable.
     await waitFor(() => {
       expect(fetchMock.mock.calls.some(([i]) =>
         i.toString() === '/api/workspace/context')).toBe(true);
@@ -3443,7 +3768,7 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
     expect(screen.queryByTestId('settings-agent-card-amr-upgrade')).toBeNull();
   });
 
-  it('reveals AMR cancel only while hovering the active card during sign-in', async () => {
+  it('keeps Cancel visible on both the AMR card and the callout during sign-in', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = input.toString();
       if (url === '/api/workspace/context') {
@@ -3483,16 +3808,13 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
     const amrCardButton = screen.getByTestId('settings-agent-select-amr');
     const amrCard = amrCardButton.closest('.agent-card') as HTMLElement;
     expect(amrCard).toBeTruthy();
-    expect(await screen.findByText('Signing in…')).toBeTruthy();
-    expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull();
-
-    fireEvent.mouseEnter(amrCard);
-    expect(await screen.findByRole('button', { name: 'Cancel' })).toBeTruthy();
-
-    fireEvent.mouseLeave(amrCard);
-    await waitFor(() => {
-      expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull();
-    });
+    expect(await within(amrCard).findByText('Signing in…')).toBeTruthy();
+    // Cancel no longer hides behind hover: it stays on the card for the whole
+    // pending sign-in, and the Settings callout offers the same action.
+    expect(within(amrCard).getByRole('button', { name: 'Cancel' })).toBeTruthy();
+    const callout = document.querySelector('.settings-cloud-signin-callout');
+    if (!(callout instanceof HTMLElement)) throw new Error('missing cloud callout');
+    expect(within(callout).getByRole('button', { name: 'Cancel' })).toBeTruthy();
   });
 
   it('cancels an in-flight AMR sign-in and returns to Authorize after a brief canceled state', async () => {
@@ -3558,8 +3880,7 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
     const amrCard = screen.getByTestId('settings-agent-select-amr').closest('.agent-card') as HTMLElement;
     expect(await screen.findByText('Signing in…')).toBeTruthy();
 
-    fireEvent.mouseEnter(amrCard);
-    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
+    fireEvent.click(await within(amrCard).findByRole('button', { name: 'Cancel' }));
 
     expect(await screen.findByText('Canceled')).toBeTruthy();
     expect(fetchMock).toHaveBeenCalledWith(
@@ -3571,7 +3892,7 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
     );
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Authorize' })).toBeTruthy();
+      expect(within(amrCardElement()).getByRole('button', { name: 'Sign up / Sign in' })).toBeTruthy();
     }, { timeout: 3000 });
     expect(screen.queryByText('Canceled')).toBeNull();
   });
@@ -3639,8 +3960,7 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
     const amrCard = screen.getByTestId('settings-agent-select-amr').closest('.agent-card') as HTMLElement;
     expect(await screen.findByText('Signing in…')).toBeTruthy();
 
-    fireEvent.mouseEnter(amrCard);
-    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
+    fireEvent.click(await within(amrCard).findByRole('button', { name: 'Cancel' }));
 
     expect(await screen.findByText('Canceled')).toBeTruthy();
     expect(cancelReceived).toBe(true);
@@ -3654,7 +3974,7 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
 
     // Eventually the Canceled UI window times out and Authorize re-appears.
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Authorize' })).toBeTruthy();
+      expect(within(amrCardElement()).getByRole('button', { name: 'Sign up / Sign in' })).toBeTruthy();
     }, { timeout: 3000 });
     // And still no bounce back to Signing in…
     expect(screen.queryByText('Signing in…')).toBeNull();
@@ -3732,8 +4052,7 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
     const amrCard = screen.getByTestId('settings-agent-select-amr').closest('.agent-card') as HTMLElement;
     expect(await screen.findByText('Signing in…')).toBeTruthy();
 
-    fireEvent.mouseEnter(amrCard);
-    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
+    fireEvent.click(await within(amrCard).findByRole('button', { name: 'Cancel' }));
     expect(await screen.findByText('Canceled')).toBeTruthy();
 
     statusStage = 'signed-in';
@@ -3922,13 +4241,7 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
     });
   });
 
-  // recvpZPzGJL7o7: "cli 页面的余额数据取的还是 personal 空间的余额". The local-CLI
-  // card read ONLY vela's account-scoped balance (`account.balanceUsd`, then
-  // the `/api/integrations/vela/wallet` snapshot) — the same account-scoped
-  // projection `resolvePlanTier` already exists to override for the plan badge
-  // on this exact card. The explicit workspace balance from
-  // `useWorkspaceBillingResponse` must win once it has loaded.
-  it('prefers the workspace billing balance over the account-scoped wallet snapshot', async () => {
+  it('keeps the Settings team balance aligned with the selected workspace wallet', async () => {
     const context = teamMemberWorkspaceContext({
       workspaceId: 'ws-team',
       workspaceMemberId: 'member-team',
@@ -3986,6 +4299,7 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
             loggedIn: true,
             profile: 'feature-test',
             user: { id: 'user-1', email: 'signed-in@example.com', name: 'Signed In User' },
+            account: { plan: 'plus', balanceUsd: '18.7931' },
             configPath: '/Users/test/.amr/config.json',
           }),
           { status: 200, headers: { 'content-type': 'application/json' } },
@@ -4020,14 +4334,80 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
 
     fireEvent.click(screen.getByRole('tab', { name: /Local CLI.*1 installed/i }));
 
-    // recvqakgSc1Pwd: the card must format `balanceUsd` (a real dollar
-    // figure vela reports), never `totalAvailableCredits` (a raw credits
-    // count) — feeding the credits count through the USD formatter is how a
-    // FEATURE TEST workspace with 388307 credits rendered "Balance
-    // $388307.00" in Settings > Models & providers > Local CLI.
-    expect(await screen.findByText('$9.99')).toBeTruthy();
-    expect(screen.queryByText('$99933.00')).toBeNull();
-    expect(screen.queryByText('$138.63')).toBeNull();
+    // The card keeps the selected CLI identity, but its Team badge and money
+    // must describe the same current environment + workspace as the global
+    // workspace chrome. Neither account-scoped source may replace that value.
+    const amrCard = screen.getByTestId('settings-agent-card-amr');
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([input]) =>
+        input.toString().startsWith('/api/workspace/billing?'))).toBe(true);
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(amrCard.querySelector('.agent-card-amr-balance-value')?.textContent).toBe('$9.99');
+    expect(amrCard.textContent).not.toContain('$18.79');
+    expect(amrCard.textContent).not.toContain('$138.63');
+  });
+
+  it('does not flash a personal AMR balance while the Team workspace context is loading', async () => {
+    const pendingDirectory = deferred<Response>();
+    let walletCalls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/workspace/directory') return pendingDirectory.promise;
+      if (url === '/api/memory') {
+        return new Response(
+          JSON.stringify({ enabled: true, memories: [], extraction: null }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url === '/api/integrations/vela/status') {
+        return new Response(
+          JSON.stringify({
+            loggedIn: true,
+            profile: 'feature-test',
+            user: { id: 'user-1', email: 'signed-in@example.com' },
+            account: { plan: 'plus', balanceUsd: '18.7931' },
+            configPath: '/Users/test/.amr/config.json',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url === '/api/integrations/vela/wallet') {
+        walletCalls += 1;
+        return new Response(
+          JSON.stringify({
+            status: 'available',
+            profile: 'feature-test',
+            user: { id: 'user-1', email: 'signed-in@example.com' },
+            balanceUsd: '138.63',
+            updatedAt: '2026-07-21T08:00:00.000Z',
+            fetchedAt: '2026-07-21T08:00:01.000Z',
+            stale: false,
+            source: 'vela_api',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderSettingsDialog(
+      { mode: 'daemon', agentId: 'amr' },
+      { agents: [amrAgent] },
+    );
+
+    fireEvent.click(screen.getByRole('tab', { name: /Local CLI.*1 installed/i }));
+
+    const amrCard = screen.getByTestId('settings-agent-card-amr');
+    expect(await within(amrCard).findByText('signed-in@example.com')).toBeTruthy();
+    expect(amrCard.querySelector('.agent-card-amr-balance-value')?.textContent).toBe('Loading…');
+    expect(amrCard.textContent).not.toContain('$18.79');
+    expect(amrCard.textContent).not.toContain('$138.63');
+    expect(walletCalls).toBe(0);
   });
 
   it('renders env-backed AMR login inside Settings without fabricating account details', async () => {
@@ -4127,7 +4507,7 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
       { agents: [amrAgent] },
     );
     fireEvent.click(screen.getByRole('tab', { name: /Local CLI.*1 installed/i }));
-    expect(await screen.findByRole('button', { name: 'Authorize' })).toBeTruthy();
+    expect(await within(amrCardElement()).findByRole('button', { name: 'Sign up / Sign in' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Sign out' })).toBeNull();
     second.unmount();
   });
@@ -4184,7 +4564,7 @@ describe('SettingsDialog execution settings Local CLI interactions', () => {
     // dialog; the real logout only runs after confirming.
     fireEvent.click(screen.getByTestId('sign-out-confirm-accept'));
 
-    expect(await screen.findByRole('button', { name: 'Authorize' })).toBeTruthy();
+    expect(await within(amrCardElement()).findByRole('button', { name: 'Sign up / Sign in' })).toBeTruthy();
     expect(screen.getByTestId('settings-agent-select-amr')).toBeTruthy();
     expect(
       onPersist.mock.calls.some(
@@ -4683,12 +5063,12 @@ describe('SettingsDialog MCP server interactions', () => {
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith('/api/mcp/install-info');
     });
-    expect(screen.getByRole('heading', { name: /Connect Open Design to your coding agent/i })).toBeTruthy();
+    expect(screen.getByRole('heading', { name: /Connect OpenDesign to your coding agent/i })).toBeTruthy();
     expect(screen.queryByText(/Run this command in your terminal/i)).toBeNull();
     await waitFor(() => {
       expect(screen.getByText(/claude mcp add-json --scope user open-design/i)).toBeTruthy();
     });
-    expect(screen.getByText(/Keep Open Design running\. Restart your coding agent after setup\./i)).toBeTruthy();
+    expect(screen.getByText(/Keep OpenDesign running\. Restart your coding agent after setup\./i)).toBeTruthy();
     expect(screen.getByText(/What your agent can do/i)).toBeTruthy();
   });
 
@@ -4824,22 +5204,17 @@ describe('SettingsDialog notifications interactions', () => {
     cleanup();
   });
 
-  it('renders notifications inactive by default and only reveals sound pickers when enabled', () => {
+  it('renders notifications active by default and keeps the sound choices available', () => {
     renderSettingsDialog(
       { mode: 'daemon', agentId: 'codex' },
       { initialSection: 'notifications' },
     );
 
     expect(screen.getByRole('group', { name: 'Completion sound' })).toBeTruthy();
-    // Each row is now a 使用中/未使用 pill pair instead of one toggle button;
-    // "未使用" (inactive) is pressed by default, "使用中" (active) is not.
-    expect(screen.getAllByRole('button', { name: 'inactive' })[0]?.getAttribute('aria-pressed')).toBe('true');
-    expect(screen.getAllByRole('button', { name: 'active' })[0]?.getAttribute('aria-pressed')).toBe('false');
-    expect(screen.queryByRole('group', { name: 'Success sound' })).toBeNull();
-    expect(screen.queryByRole('group', { name: 'Failure sound' })).toBeNull();
-
-    fireEvent.click(screen.getAllByRole('button', { name: 'active' })[0] as HTMLButtonElement);
-    expect(playSoundMock).toHaveBeenCalledWith('ding');
+    expect(screen.getAllByRole('button', { name: 'active' })[0]?.getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getAllByRole('button', { name: 'active' })[1]?.getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getAllByRole('button', { name: 'inactive' })[0]?.getAttribute('aria-pressed')).toBe('false');
+    expect(screen.getAllByRole('button', { name: 'inactive' })[1]?.getAttribute('aria-pressed')).toBe('false');
     expect(screen.getByRole('group', { name: 'Success sound' })).toBeTruthy();
     expect(screen.getByRole('group', { name: 'Failure sound' })).toBeTruthy();
   });
@@ -4885,7 +5260,16 @@ describe('SettingsDialog notifications interactions', () => {
     showCompletionNotificationMock.mockResolvedValue('shown');
 
     renderSettingsDialog(
-      { mode: 'daemon', agentId: 'codex' },
+      {
+        mode: 'daemon',
+        agentId: 'codex',
+        notifications: {
+          soundEnabled: true,
+          successSoundId: 'ding',
+          failureSoundId: 'buzz',
+          desktopEnabled: false,
+        },
+      },
       { initialSection: 'notifications' },
     );
 
@@ -4913,7 +5297,16 @@ describe('SettingsDialog notifications interactions', () => {
     requestNotificationPermissionMock.mockResolvedValue('denied');
 
     renderSettingsDialog(
-      { mode: 'daemon', agentId: 'codex' },
+      {
+        mode: 'daemon',
+        agentId: 'codex',
+        notifications: {
+          soundEnabled: true,
+          successSoundId: 'ding',
+          failureSoundId: 'buzz',
+          desktopEnabled: false,
+        },
+      },
       { initialSection: 'notifications' },
     );
 
@@ -5564,6 +5957,7 @@ describe('SettingsDialog about interactions', () => {
   afterEach(() => {
     cleanup();
     vi.useRealTimers();
+    vi.unstubAllGlobals();
   });
 
   it('drops a pending autosave when explicit onboarding reset unmounts Settings', () => {
@@ -5612,6 +6006,8 @@ describe('SettingsDialog about interactions', () => {
   });
 
   it('renders app version and runtime details when version info is available', () => {
+    const fetchMock = vi.fn<typeof fetch>();
+    vi.stubGlobal('fetch', fetchMock);
     renderSettingsDialog(
       { mode: 'daemon', agentId: 'codex' },
       {
@@ -5636,6 +6032,12 @@ describe('SettingsDialog about interactions', () => {
     expect(screen.getByText('darwin')).toBeTruthy();
     expect(screen.getByText('Architecture')).toBeTruthy();
     expect(screen.getByText('arm64')).toBeTruthy();
+    // OD Next routing is product-owned and invisible to end users. About must
+    // not expose the daemon's internal rollout control.
+    expect(screen.queryByTestId('od-next-rollout-control')).toBeNull();
+    expect(fetchMock.mock.calls.some(([input]) => (
+      String(input).includes('/api/strategies/od-next/rollout')
+    ))).toBe(false);
   });
 
   it('renders the unavailable fallback when app version info is missing', () => {

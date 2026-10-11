@@ -219,7 +219,7 @@ describe('FileViewer version download actions', () => {
     expect(exportAsPdfMock).not.toHaveBeenCalled();
   });
 
-  it('shows main export errors for historical version PDFs', async () => {
+  it('shows the generic export-failed copy (not the raw renderer error) for historical version PDFs', async () => {
     isOpenDesignHostAvailableMock.mockReturnValue(true);
     exportProjectScreenshotPdfMock.mockResolvedValueOnce({ ok: false, error: 'version renderer failed' });
     const { file } = setupVersionFetch();
@@ -228,7 +228,10 @@ describe('FileViewer version download actions', () => {
     openVersionDownloadMenu(versionDialog);
     fireEvent.click(within(versionDialog).getByRole('menuitem', { name: 'Export as PDF' }));
 
-    expect(await screen.findByText(/version renderer failed/)).toBeTruthy();
+    // OPEND-2849 / S26: raw renderer strings never reach the user.
+    expect(await screen.findByText('Export failed')).toBeTruthy();
+    expect(screen.getByText('This export did not complete. Please try again.')).toBeTruthy();
+    expect(screen.queryByText(/version renderer failed/)).toBeNull();
     expect(requestPreviewSnapshotMock).not.toHaveBeenCalled();
     expect(captureHostIframeSnapshotMock).not.toHaveBeenCalled();
     expect(exportSnapshotAsPdfMock).not.toHaveBeenCalled();
@@ -256,9 +259,10 @@ describe('FileViewer version download actions', () => {
   ] as const)('shows a loading toast while running the version %s action', async (menuItemName, exporter) => {
     exporter.mockReturnValueOnce(new Promise(() => {}));
     const { file } = setupVersionFetch();
-    const versionDialog = await renderVersionDialog(file);
+    const currentVersion = menuItemName === 'Export as standalone HTML';
+    const versionDialog = await renderVersionDialog(file, currentVersion ? 'current' : undefined);
 
-    openVersionDownloadMenu(versionDialog);
+    openVersionDownloadMenu(versionDialog, currentVersion ? 2 : undefined);
     fireEvent.click(within(versionDialog).getByRole('menuitem', { name: menuItemName }));
 
     await waitFor(() => {
@@ -322,24 +326,13 @@ describe('FileViewer version download actions', () => {
     expect(requestPreviewSnapshotMock).not.toHaveBeenCalled();
   });
 
-  it('routes version HTML and ZIP actions through the selected version content', async () => {
+  it('hides historical HTML while routing ZIP through the selected version content', async () => {
     const { file, priorContent } = setupVersionFetch();
     const versionDialog = await renderVersionDialog(file);
 
     openVersionDownloadMenu(versionDialog);
-    fireEvent.click(within(versionDialog).getByRole('menuitem', { name: 'Export as standalone HTML' }));
+    expect(within(versionDialog).queryByRole('menuitem', { name: 'Export as standalone HTML' })).toBeNull();
 
-    await waitFor(() => {
-      expect(exportProjectAsHtmlMock).toHaveBeenCalledWith(expect.objectContaining({
-        fallbackHtml: priorContent,
-        fallbackTitle: 'index-v1',
-        filePath: 'index.html',
-        projectId: 'project-1',
-        versionId: 'v1',
-      }));
-    });
-
-    openVersionDownloadMenu(versionDialog);
     fireEvent.click(within(versionDialog).getByRole('menuitem', { name: 'Download as .zip' }));
 
     await waitFor(() => {
@@ -351,6 +344,7 @@ describe('FileViewer version download actions', () => {
         versionId: 'v1',
       }));
     });
+    expect(exportProjectAsHtmlMock).not.toHaveBeenCalled();
     expect(exportAsHtmlMock).not.toHaveBeenCalled();
     expect(exportAsZipMock).not.toHaveBeenCalled();
   });
@@ -364,7 +358,6 @@ describe('FileViewer version download actions', () => {
 
     await waitFor(() => {
       expect(exportProjectAsHtmlMock).toHaveBeenCalledWith(expect.objectContaining({
-        fallbackHtml: '<html><body><h1>Current</h1></body></html>',
         fallbackTitle: 'index',
         filePath: 'index.html',
         projectId: 'project-1',
